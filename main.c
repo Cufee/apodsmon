@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <glib.h>
 
@@ -44,10 +45,10 @@ struct adapter {
 };
 
 static struct adapter *default_ctrl;
-static GDBusProxy *default_dev;
 
 #define AIRPODS_UUID "74ec2172-0bad-4d01-8f77-997b2be0722a"
 static bool airpods_connected = false;
+static GList *all_device_proxies = NULL;
 
 #define	DISTANCE_VAL_INVALID	0x7FFF
 
@@ -264,19 +265,26 @@ static void print_fixed_iter(const char *label, const char *name,
 
             if (left > 0 && left <= 10)
                 valid_left = left == 10 ? 100 : left * 10 + 5;
+            else
+                valid_left = 0;
+
             if (right > 0 && right <= 10)
                 valid_right = right == 10 ? 100 : right * 10 + 5;
+            else
+                valid_right = 0;
+
             if (_case > 0 && _case <= 10)
                 valid_case = _case == 10 ? 100 : _case * 10 + 5;
+            else
+                valid_case = 0;
 
             if (valid_left > 0 && valid_right == 0)
                 valid_right = valid_left;
             else if (valid_right > 0 && valid_left == 0)
                 valid_left = valid_right;
 
-            fprintf(OUTPUT, "L: %d ", valid_left);
-            fprintf(OUTPUT, "R: %d ", valid_right);
-            fprintf(OUTPUT, "C: %d\n", valid_case);
+            fprintf(OUTPUT, "{\"ts\":%ld,\"left\":%d,\"right\":%d,\"case\":%d}\n",
+                    (long)time(NULL), valid_left, valid_right, valid_case);
             fflush(OUTPUT);
         }
 		break;
@@ -407,19 +415,27 @@ static bool device_is_connected(GDBusProxy *proxy)
     return connected == TRUE;
 }
 
-static void update_airpods_connected(GDBusProxy *proxy)
+static void recheck_airpods_connected(void)
 {
-    if (!device_has_airpods_uuid(proxy))
-        return;
+    bool found = false;
+
+    for (GList *l = all_device_proxies; l; l = l->next) {
+        GDBusProxy *p = l->data;
+        if (device_is_connected(p) && device_has_airpods_uuid(p)) {
+            found = true;
+            break;
+        }
+    }
 
     bool was_connected = airpods_connected;
-    airpods_connected = device_is_connected(proxy);
+    airpods_connected = found;
 
     if (was_connected && !airpods_connected) {
         valid_left = 0;
         valid_right = 0;
         valid_case = 0;
-        fprintf(OUTPUT, "L: NA R: NA C: NA\n");
+        fprintf(OUTPUT, "{\"ts\":%ld,\"left\":-1,\"right\":-1,\"case\":-1}\n", (long)time(NULL));
+    fflush(OUTPUT);
         fflush(OUTPUT);
     }
 }
@@ -431,7 +447,8 @@ static void proxy_added(GDBusProxy *proxy, void *user_data)
 	interface = g_dbus_proxy_get_interface(proxy);
 
 	if (!strcmp(interface, "org.bluez.Device1")) {
-        update_airpods_connected(proxy);
+        all_device_proxies = g_list_append(all_device_proxies, proxy);
+        recheck_airpods_connected();
     } else if (!strcmp(interface, "org.bluez.Adapter1")) {
 		adapter_added(proxy);
     }
@@ -444,14 +461,8 @@ static void proxy_removed(GDBusProxy *proxy, void *user_data)
 	interface = g_dbus_proxy_get_interface(proxy);
 
 	if (!strcmp(interface, "org.bluez.Device1")) {
-        if (device_has_airpods_uuid(proxy)) {
-            airpods_connected = false;
-            valid_left = 0;
-            valid_right = 0;
-            valid_case = 0;
-            fprintf(OUTPUT, "L: NA R: NA C: NA\n");
-            fflush(OUTPUT);
-        }
+        all_device_proxies = g_list_remove(all_device_proxies, proxy);
+        recheck_airpods_connected();
     }
 }
 
@@ -463,10 +474,8 @@ static void property_changed(GDBusProxy *proxy, const char *name,
 	interface = g_dbus_proxy_get_interface(proxy);
 
 	if (!strcmp(interface, "org.bluez.Device1")) {
-        if (!strcmp(name, "Connected")) {
-            update_airpods_connected(proxy);
-            return;
-        }
+        if (!strcmp(name, "Connected") || !strcmp(name, "UUIDs"))
+            recheck_airpods_connected();
 
         if (!airpods_connected)
             return;
@@ -479,7 +488,6 @@ int main(int argc, char *argv[])
 {
     GMainLoop *main_loop;
 	GDBusClient *client;
-	int status;
 
     if (argc == 1) {
         OUTPUT = stdout;
@@ -498,7 +506,8 @@ int main(int argc, char *argv[])
         exit(-1);
     }
 
-    fprintf(OUTPUT, "L: NA R: NA C: NA\n");
+    fprintf(OUTPUT, "{\"ts\":%ld,\"left\":-1,\"right\":-1,\"case\":-1}\n", (long)time(NULL));
+    fflush(OUTPUT);
     fflush(OUTPUT);
 
 	dbus_conn = g_dbus_setup_bus(DBUS_BUS_SYSTEM, NULL, NULL);
@@ -516,5 +525,5 @@ int main(int argc, char *argv[])
 
 	dbus_connection_unref(dbus_conn);
 
-	return status;
+	return 0;
 }
