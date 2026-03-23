@@ -60,10 +60,12 @@ static struct set_discovery_filter_args {
 	bool set;
 	bool active;
 } filter = {
+	.transport = "le",
 	.rssi = DISTANCE_VAL_INVALID,
 	.pathloss = DISTANCE_VAL_INVALID,
 	.set = false,
     .discoverable = false,
+    .duplicate = TRUE,
     .active = true,
 };
 
