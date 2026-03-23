@@ -46,6 +46,9 @@ struct adapter {
 static struct adapter *default_ctrl;
 static GDBusProxy *default_dev;
 
+#define AIRPODS_UUID "74ec2172-0bad-4d01-8f77-997b2be0722a"
+static bool airpods_connected = false;
+
 #define	DISTANCE_VAL_INVALID	0x7FFF
 
 static struct set_discovery_filter_args {
@@ -252,25 +255,28 @@ static void print_fixed_iter(const char *label, const char *name,
 		if (len <= 0)
 			return;
 
-        if (found && len == 27) {
+        if (found && len == 27 && byte[0] == 0x07 && byte[4] == 0x20) {
+
             int left, right, _case;
             left = (byte[6] & 0xf0) >> 4;
             right = (byte[6] & 0xf);
             _case = (byte[7] & 0x0f);
 
-            if (left <= 10) {
-                valid_left = left;
-            }
-            if (right <= 10) {
-                valid_right = right;
-            }
-            if (_case <= 10) {
-                valid_case = _case;
-            }
+            if (left > 0 && left <= 10)
+                valid_left = left == 10 ? 100 : left * 10 + 5;
+            if (right > 0 && right <= 10)
+                valid_right = right == 10 ? 100 : right * 10 + 5;
+            if (_case > 0 && _case <= 10)
+                valid_case = _case == 10 ? 100 : _case * 10 + 5;
 
-            fprintf(OUTPUT, "L: %d ", valid_left * 10);
-            fprintf(OUTPUT, "R: %d ", valid_right * 10);
-            fprintf(OUTPUT, "C: %d\n", valid_case * 10);
+            if (valid_left > 0 && valid_right == 0)
+                valid_right = valid_left;
+            else if (valid_right > 0 && valid_left == 0)
+                valid_left = valid_right;
+
+            fprintf(OUTPUT, "L: %d ", valid_left);
+            fprintf(OUTPUT, "R: %d ", valid_right);
+            fprintf(OUTPUT, "C: %d\n", valid_case);
             fflush(OUTPUT);
         }
 		break;
@@ -367,6 +373,57 @@ static void print_property(GDBusProxy *proxy, const char *name)
 	print_iter("\t", name, &iter, false);
 }
 
+static bool device_has_airpods_uuid(GDBusProxy *proxy)
+{
+    DBusMessageIter iter, arr;
+
+    if (g_dbus_proxy_get_property(proxy, "UUIDs", &iter) == FALSE)
+        return false;
+
+    if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY)
+        return false;
+
+    dbus_message_iter_recurse(&iter, &arr);
+    while (dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_STRING) {
+        const char *uuid;
+        dbus_message_iter_get_basic(&arr, &uuid);
+        if (strcasecmp(uuid, AIRPODS_UUID) == 0)
+            return true;
+        dbus_message_iter_next(&arr);
+    }
+
+    return false;
+}
+
+static bool device_is_connected(GDBusProxy *proxy)
+{
+    DBusMessageIter iter;
+    dbus_bool_t connected;
+
+    if (g_dbus_proxy_get_property(proxy, "Connected", &iter) == FALSE)
+        return false;
+
+    dbus_message_iter_get_basic(&iter, &connected);
+    return connected == TRUE;
+}
+
+static void update_airpods_connected(GDBusProxy *proxy)
+{
+    if (!device_has_airpods_uuid(proxy))
+        return;
+
+    bool was_connected = airpods_connected;
+    airpods_connected = device_is_connected(proxy);
+
+    if (was_connected && !airpods_connected) {
+        valid_left = 0;
+        valid_right = 0;
+        valid_case = 0;
+        fprintf(OUTPUT, "L: NA R: NA C: NA\n");
+        fflush(OUTPUT);
+    }
+}
+
 static void proxy_added(GDBusProxy *proxy, void *user_data)
 {
 	const char *interface;
@@ -374,7 +431,7 @@ static void proxy_added(GDBusProxy *proxy, void *user_data)
 	interface = g_dbus_proxy_get_interface(proxy);
 
 	if (!strcmp(interface, "org.bluez.Device1")) {
-        //device_added(proxy);
+        update_airpods_connected(proxy);
     } else if (!strcmp(interface, "org.bluez.Adapter1")) {
 		adapter_added(proxy);
     }
@@ -387,7 +444,14 @@ static void proxy_removed(GDBusProxy *proxy, void *user_data)
 	interface = g_dbus_proxy_get_interface(proxy);
 
 	if (!strcmp(interface, "org.bluez.Device1")) {
-        //printf("REMOVED device\n");
+        if (device_has_airpods_uuid(proxy)) {
+            airpods_connected = false;
+            valid_left = 0;
+            valid_right = 0;
+            valid_case = 0;
+            fprintf(OUTPUT, "L: NA R: NA C: NA\n");
+            fflush(OUTPUT);
+        }
     }
 }
 
@@ -399,22 +463,15 @@ static void property_changed(GDBusProxy *proxy, const char *name,
 	interface = g_dbus_proxy_get_interface(proxy);
 
 	if (!strcmp(interface, "org.bluez.Device1")) {
-        DBusMessageIter addr_iter;
-        char *str;
-
-        if (g_dbus_proxy_get_property(proxy, "Address",
-                                      &addr_iter) == TRUE) {
-            const char *address;
-
-            dbus_message_iter_get_basic(&addr_iter,
-                                        &address);
-            str = g_strdup_printf("Device %s ", address);
-        } else {
-            str = g_strdup("");
+        if (!strcmp(name, "Connected")) {
+            update_airpods_connected(proxy);
+            return;
         }
 
-        print_iter(str, name, iter, false);
-        g_free(str);
+        if (!airpods_connected)
+            return;
+
+        print_iter("", name, iter, false);
     }
 }
 
@@ -427,13 +484,17 @@ int main(int argc, char *argv[])
     if (argc == 1) {
         OUTPUT = stdout;
     } else if (argc == 2) {
-        OUTPUT = fopen(argv[1], "w+");
-        if (OUTPUT == NULL) {
-            perror("Can't open file");
-            exit(-1);
+        if (strcmp(argv[1], "-") == 0) {
+            OUTPUT = stdout;
+        } else {
+            OUTPUT = fopen(argv[1], "w+");
+            if (OUTPUT == NULL) {
+                perror("Can't open file");
+                exit(-1);
+            }
         }
     } else {
-        printf("Usage: %s [output_file]\n", argv[0]);
+        printf("Usage: %s [output_file|-]\n", argv[0]);
         exit(-1);
     }
 
